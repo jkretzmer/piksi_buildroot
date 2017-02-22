@@ -1,0 +1,8 @@
+#!/bin/sh
+
+name="gdbserver"
+cmd="gdbserver --multi :2000"
+dir="/"
+user=""
+
+source /etc/init.d/template_process.inc.sh
