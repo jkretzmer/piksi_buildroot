@@ -9,7 +9,7 @@ BLACKMAGIC_SITE = https://github.com/swift-nav/blackmagic
 BLACKMAGIC_SITE_METHOD = git
 
 define BLACKMAGIC_BUILD_CMDS
-    $(MAKE) CC=$(TARGET_CC) LD=$(TARGET_LD) -C $(@D)/src
+    $(MAKE) -j1 CC=$(TARGET_CC) LD=$(TARGET_LD) -C $(@D)/src
 endef
 
 define BLACKMAGIC_INSTALL_TARGET_CMDS
