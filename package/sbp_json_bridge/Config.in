@@ -1,5 +1,0 @@
-config BR2_PACKAGE_SBP_JSON_BRIDGE
-	bool "sbp_json_bridge"
-	select BR2_PACKAGE_CZMQ
-	select BR2_PACKAGE_LIBSBP
-	select BR2_PACKAGE_LIBPIKSI

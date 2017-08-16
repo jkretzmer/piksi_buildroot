@@ -13,19 +13,18 @@
 #include "sbp_json_lws.h"
 
 #define PROGRAM_NAME "sbp_json_lws"
+#define SBP_JSON_REQ "SBP_JSON_REQ"
 #define PUB_ENDPOINT ">tcp://localhost:43031"
 #define SUB_ENDPOINT ">tcp://localhost:43030"
 #define WEBSERVER_PORT (5000)
 #define SBP_MSG_ALL (0)
 #define SBP_JSON_MAX_SIZE (2048)
-#define SOCKET_BUFFER_SIZE (8192)
-#define SBP_JSON_MAX_ITEMS (20)
+#define SBP_JSON_MAX_ITEMS (100)
+#define SBP_PRUNE_SIZE (20)
+#define SOCKET_BUFFER_SIZE (4096)
+#define LOCAL_RESOURCE_PATH "/etc/client/"
 
-const char INTERFACE_FILE[] = "/etc/syrinx.html";
-char* SBP_JSON_QUEUE[256];
-
-int sbp_write = 0;
-int sbp_read = 0;
+const char INTERFACE_FILE[] = "/etc/client/index.html";
 
 /* zmq connection and sbp2json thread handle */
 pthread_t zmq_sbp2json_pthread_t;
@@ -41,6 +40,16 @@ pthread_cond_t sbp_json_data_ready_cond = PTHREAD_COND_INITIALIZER;
 bool sbp_json_data_ready = false;
 
 char SBP_JSON_BUFFER[SBP_JSON_MAX_SIZE];
+
+int sbp_json_list_size = 0;
+
+struct sbp_json_node {
+  char json_text[SBP_JSON_MAX_SIZE];
+  struct sbp_json_node* next;
+};
+
+struct sbp_json_node* sbp_head = NULL;
+struct sbp_json_node* sbp_tail = NULL;
 
 /* lws_protocols - struct listing protocols in use by this webserver
  *
@@ -58,6 +67,25 @@ static struct lws_protocols protocols[] =
   {NULL, NULL, 0} /* terminator */
 };
 
+static const struct lws_http_mount mount = {
+	NULL,		/* linked-list pointer to next*/
+	"/",		/* mountpoint in URL namespace on this vhost */
+	LOCAL_RESOURCE_PATH, /* where to go on the filesystem for that */
+	"index.html",	/* default filename if none given */
+	NULL,
+	NULL,
+	NULL,
+	NULL,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	LWSMPRO_FILE,	/* mount type is a directory in a filesystem */
+	1,		/* strlen("/"), ie length of the mountpoint */
+};
+
 static int sbp_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
   void* user, void* in, size_t len)
 {
@@ -67,42 +95,92 @@ static int sbp_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
     break;
   case LWS_CALLBACK_RECEIVE:
     printf("callback received\n");
-    lws_callback_on_writable_all_protocol(lws_get_context(wsi),
-      lws_get_protocol(wsi));
+    char ws_cmd_buffer[255];
+    memset(ws_cmd_buffer, '\0', 255);
+    memcpy(&ws_cmd_buffer, in, len);
+
+    if (strncmp(ws_cmd_buffer, SBP_JSON_REQ, 255) == 0){
+      printf("recv: %s\n", ws_cmd_buffer);
+      lws_callback_on_writable_all_protocol(lws_get_context(wsi),
+        lws_get_protocol(wsi));
+    }
+
     break;
   case LWS_CALLBACK_SERVER_WRITEABLE:
   {
-    //printf("callback server writeable received\n");
-    /* setup buffer for LWS write call
-     * format is LWS_SEND_BUFFER_PRE_PADDING + DATA
-     * + LWS_SEND_BUFFER_POST_PADDING
-     */
-    unsigned char write_buffer[LWS_SEND_BUFFER_PRE_PADDING + SBP_JSON_MAX_SIZE
-      + LWS_SEND_BUFFER_POST_PADDING];
-		unsigned char *data_location = &write_buffer[LWS_SEND_BUFFER_PRE_PADDING];
-    // clear buffer
-    memset(data_location, '\0', SBP_JSON_MAX_SIZE);
-    int buffer_len = 0;
+    // keep track of how much data is to be sent
+    int write_msg_size = 0;
+    // store a pointer to where the JSON data begins in the write_buffer
+    unsigned char *data_location = NULL;
+    // lock mutex
     pthread_mutex_lock(&sbp_json_buffer_mutex);
-    //printf("lws->lock->sbp_json_buffer_mutex\n");
-
-    while(sbp_json_data_ready == false) {
-      pthread_cond_wait(&sbp_json_data_ready_cond, &sbp_json_buffer_mutex);
+    // if the sbp_head is NULL, the queue has not yet been initialized.
+    if (!sbp_head) {
+      printf("sbp_head is NULL - JSON queue is empty\n");
     }
+    else {
+      /* setup buffer for LWS write call
+       * format is LWS_SEND_BUFFER_PRE_PADDING + DATA
+       * + LWS_SEND_BUFFER_POST_PADDING
+       */
+      unsigned char write_buffer[LWS_SEND_BUFFER_PRE_PADDING + SOCKET_BUFFER_SIZE
+         + LWS_SEND_BUFFER_POST_PADDING];
 
-    buffer_len = strlen(SBP_JSON_BUFFER);
-    if (buffer_len != 0) {
-      size_t data_size = sprintf((char *)data_location, "%s", SBP_JSON_BUFFER);
-      memset(SBP_JSON_BUFFER, '\0', SBP_JSON_MAX_SIZE);
+      data_location = &write_buffer[LWS_SEND_BUFFER_PRE_PADDING];
+      // null out buffer
+      memset(data_location, '\0', SOCKET_BUFFER_SIZE);
+      // pointer for keeping track of write location
+      unsigned char *buffer_write_location = data_location;
+      // loop through list of sbp_jsone_node until the next node is the tail
+      while(sbp_head->next != sbp_tail) {
+        // create a pointer to store the current head
+        struct sbp_json_node* current_node = sbp_head;
+        /* sbp json messages are assumed to be null terminated
+         * use strlen to get the length of the current json string
+         */
+        int current_msg_size =  strlen(current_node->json_text);
+        /* check to see if the current message (plus a null character)
+         * will fit in the write_buffer
+         */
+        if (write_msg_size + current_msg_size +1 < SOCKET_BUFFER_SIZE) {
+          /* copy JSON from current_node in to write_buffer
+           * @ buffer_write_location
+           */
+          memcpy(buffer_write_location, current_node->json_text, current_msg_size);
+          // move buffer_write_location forward by amount written + 1
+          //printf("%s\n", buffer_write_location);
+          buffer_write_location += current_msg_size+1;
+          // update the size of msg to be sent
+          write_msg_size += current_msg_size+1;
+          // move the sbp_head pointer to the next node
+          sbp_head = sbp_head->next;
+          // decrement the sbp_json_list_size (debugging info only)
+          sbp_json_list_size--;
+          // free the current node
+          free(current_node);
+          if (sbp_json_list_size > 40){
+            printf("sbp_json_list_size: %d\n", sbp_json_list_size);
+          }
+        }
+        else {
+          break;
+        }
+      }
     }
-
-    sbp_json_data_ready = false;
     pthread_mutex_unlock(&sbp_json_buffer_mutex);
-    //printf("lws->unlock->sbp_json_buffer_mutex\n");
+    if (write_msg_size > 0) {
+      lws_write(wsi, data_location, write_msg_size, LWS_WRITE_TEXT);
+    }
+    else
+    {
+      //printf("No data to send\n");
+      pthread_mutex_lock(&sbp_json_buffer_mutex);
+      sbp_json_data_ready = false;
 
-    if (buffer_len > 0) {
-      //printf("lws data: %s\n", data_location);
-      lws_write(wsi, data_location, buffer_len, LWS_WRITE_TEXT);
+      while(sbp_json_data_ready == false) {
+        pthread_cond_wait(&sbp_json_data_ready_cond, &sbp_json_buffer_mutex);
+      }
+      pthread_mutex_unlock(&sbp_json_buffer_mutex);
     }
     lws_callback_on_writable_all_protocol(lws_get_context(wsi),
       lws_get_protocol(wsi));
@@ -135,15 +213,38 @@ void sbp2json_callback(u16 sender_id, u8 len, u8 msg[], void *context)
   sbp_state_t *s = &ctx->sbp_state;
   u16 s_msg_type = s->msg_type;
 
-  //printf("s_msg_type: %u\n", s_msg_type);
+
+  struct sbp_json_node* sbp_data = (struct sbp_json_node*)malloc(sizeof(struct sbp_json_node));
+  if (sbp_data != NULL) {
+    memset(&sbp_data->json_text, '\0', SBP_JSON_MAX_SIZE);
+    sbp2json(sender_id, s_msg_type, len, msg, SBP_JSON_MAX_SIZE, sbp_data->json_text);
+  }
+
+
   pthread_mutex_lock(&sbp_json_buffer_mutex);
-  memset(SBP_JSON_BUFFER, '\0', SBP_JSON_MAX_SIZE);
-  sbp2json(sender_id, s_msg_type, len, msg, SBP_JSON_MAX_SIZE, SBP_JSON_BUFFER);
-  //printf("s_msg_type: %u - strlen: %d\n", s_msg_type, strlen(SBP_JSON_BUFFER));
+
+  if (sbp_json_list_size >= SBP_JSON_MAX_ITEMS) {
+      // printf("SBP JSON BUFFER full, pruning\n");
+      // consumer is not keeping up with buffer, prune first SBP_PRUNE_SIZE items
+      for(int i=0; i < SBP_PRUNE_SIZE; i++) {
+        struct sbp_json_node* current_node = sbp_head;
+        sbp_head = sbp_head->next;
+        sbp_json_list_size--;
+        free(current_node);
+      }
+  }
+
+  if(sbp_head == NULL && sbp_tail == NULL) {
+    sbp_head = sbp_tail = sbp_data;
+  }
+
+  sbp_tail->next = sbp_data;
+  sbp_tail = sbp_data;
+  sbp_json_list_size++;
+
   sbp_json_data_ready = true;
   pthread_cond_signal(&sbp_json_data_ready_cond);
   pthread_mutex_unlock(&sbp_json_buffer_mutex);
-  //printf("%s\n", SBP_JSON_BUFFER);
 
   return;
 }
@@ -161,11 +262,13 @@ void* webserver_thread(void *arg)
   context_info.protocols = protocols;
   context_info.gid = -1;
   context_info.uid = -1;
+  /* tell lws about our mount we want */
+	context_info.mounts = &mount;
   // create lws_context from context info struct
   struct lws_context *sbp_ws_context = lws_create_context(&context_info);
   // loop infinitley on lws_service
   while(1) {
-    lws_service(sbp_ws_context, 500);
+    lws_service(sbp_ws_context, 50);
   }
   lws_context_destroy(sbp_ws_context);
   return NULL;

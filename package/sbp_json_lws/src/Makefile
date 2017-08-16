@@ -1,6 +1,6 @@
 TARGET=sbp_json_lws
 SOURCES= \
-	sbp_json_lws.c \
+	sbp_json_lws-list.c \
 
 LIBS=-lczmq -lsbp -lpiksi -lwebsockets -lpthread
 CFLAGS=-std=gnu11

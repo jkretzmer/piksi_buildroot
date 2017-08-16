@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+<style></style>
+</head>
+
+<body>
+
+<p>...</p>
+<div id="json_log"></div>
+
+<script>
+
+var SBP_JSON_REQ = "SBP_JSON_REQ";
+var my_address = window.location.host;
+var ws = new WebSocket("ws://" + my_address, "sbp-ws");
+var json_data = '';
+
+ws.onopen = function() {
+    console.log("connection opened");
+    ws.send(SBP_JSON_REQ);
+}
+ws.onmessage = function(packet) {
+    var json_output = packet.data.split('\0');
+
+    json_output.map(function(sentence){
+      json_data = json_data + sentence +'\n';
+      console.log(sentence);
+    });
+}
+ws.onclose = function() {
+  var json_sentences = json_data.split('\n');
+  json_sentences.map(function(sentence){
+    var sentence_node = document.createTextNode(sentence);
+    document.getElementById("json_log").appendChild(sentence_node);
+    document.getElementById("json_log").appendChild(document.createElement("br"));
+  });
+  console.log("connection closed");
+}
+
+</script>
+
+</body>
+
+</html>
